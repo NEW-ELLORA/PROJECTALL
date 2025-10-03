@@ -1,0 +1,188 @@
+USE DC TO DC BUCK CONVERT TO DO THESE JOB 
+
+______________________________________________________________________
+// ===== ESP32 + nRF24L01+ PA+LNA : Transmitter (secret-key pairing) =====
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+
+// Your wiring:
+#define PIN_CE   13
+#define PIN_CSN  12
+#define PIN_SCK  14
+#define PIN_MISO 26
+#define PIN_MOSI 27
+
+RF24 radio(PIN_CE, PIN_CSN);
+
+// ---- CONFIGURE YOUR SECRET HERE (must match receiver) ----
+const char* SECRET_KEY = "12354"; // change me!
+
+// ---- derive 5-byte RF24 address from a secret string ----
+void derivePipeFromKey(const char* key, uint8_t addr[5]) {
+  uint32_t h = 0x811C9DC5u;
+  while (*key) { h ^= (uint8_t)(*key++); h *= 16777619u; }
+  addr[0] = (uint8_t)(h >>  0);
+  addr[1] = (uint8_t)(h >>  8);
+  addr[2] = (uint8_t)(h >> 16);
+  addr[3] = (uint8_t)(h >> 24);
+  addr[4] = 0xE1;
+}
+
+uint8_t pipeAddr[5];
+
+// Send a line in <=32 byte chunks + newline
+void sendLine(const String &line) {
+  String msg = line + '\n';
+  const uint8_t MAX = 32;
+  for (int i = 0; i < msg.length(); ) {
+    uint8_t n = min((int)MAX, (int)(msg.length() - i));
+    bool ok = radio.write((const void*)(msg.c_str() + i), n);
+    Serial.println(ok ? "[OK] chunk sent" : "[WARN] send failed (no ACK)");
+    i += n;
+    delay(3);
+  }
+}
+
+String lineBuf; // non-blocking serial buffer
+
+void setup() {
+  Serial.begin(115200);
+  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN);
+
+  if (!radio.begin()) {
+    Serial.println("Radio not responding (TX)!");
+    while (1) delay(1000);
+  }
+
+  // Pairing address from secret
+  derivePipeFromKey(SECRET_KEY, pipeAddr);
+
+  radio.setChannel(108);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setPALevel(RF24_PA_MIN);   // start MIN for close range
+  radio.setRetries(5, 15);
+  radio.setAutoAck(true);
+  radio.enableDynamicPayloads();
+
+  radio.openWritingPipe(pipeAddr); // use derived 5-byte pipe
+  radio.stopListening();
+
+  Serial.print("TX ready. Using keyed pipe: ");
+  for (int i=4;i>=0;--i){ Serial.print(pipeAddr[i], HEX); Serial.print(" "); }
+  Serial.println();
+  Serial.println("Type a line and press Enter.");
+}
+
+void loop() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (lineBuf.length()) {
+        Serial.print("Sending: "); Serial.println(lineBuf);
+        sendLine(lineBuf);
+        lineBuf = "";
+      }
+    } else {
+      lineBuf += c;
+      if (lineBuf.length() > 256) lineBuf = "";
+    }
+  }
+}
+
+
+
+
+
+----------------------------------------------------------------
+
+
+
+
+
+// ===== ESP32 + nRF24L01+ PA+LNA : Receiver (secret-key pairing) =====
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+
+// Your wiring:
+#define PIN_CE   13
+#define PIN_CSN  12
+#define PIN_SCK  14
+#define PIN_MISO 26
+#define PIN_MOSI 27
+
+RF24 radio(PIN_CE, PIN_CSN);
+
+// ---- SECRET must match transmitter ----
+const char* SECRET_KEY = "12354"; // change me!
+
+// ---- derive 5-byte RF24 address from a secret string ----
+void derivePipeFromKey(const char* key, uint8_t addr[5]) {
+  uint32_t h = 0x811C9DC5u;
+  while (*key) { h ^= (uint8_t)(*key++); h *= 16777619u; }
+  addr[0] = (uint8_t)(h >>  0);
+  addr[1] = (uint8_t)(h >>  8);
+  addr[2] = (uint8_t)(h >> 16);
+  addr[3] = (uint8_t)(h >> 24);
+  addr[4] = 0xE1;
+}
+
+uint8_t pipeAddr[5];
+String inbox;
+
+void setup() {
+  Serial.begin(115200);
+  SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN);
+
+  if (!radio.begin()) {
+    Serial.println("Radio not responding (RX)!");
+    while (1) delay(1000);
+  }
+
+  derivePipeFromKey(SECRET_KEY, pipeAddr);
+
+  radio.setChannel(108);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setPALevel(RF24_PA_MIN);
+  radio.setRetries(5, 15);
+  radio.setAutoAck(true);
+  radio.enableDynamicPayloads();
+
+  radio.openReadingPipe(0, pipeAddr); // only listen on keyed pipe
+  radio.startListening();
+
+  Serial.print("RX ready. Using keyed pipe: ");
+  for (int i=4;i>=0;--i){ Serial.print(pipeAddr[i], HEX); Serial.print(" "); }
+  Serial.println();
+  Serial.println("Waiting for messages...");
+}
+
+void loop() {
+  if (radio.available()) {
+    while (radio.available()) {
+      uint8_t len = radio.getDynamicPayloadSize();
+      if (len == 0 || len > 32) { uint8_t dump[32]; radio.read(dump, min((uint8_t)32, len)); continue; }
+
+      uint8_t buf[32];
+      radio.read(buf, len);
+
+      for (uint8_t i = 0; i < len; i++) {
+        char c = (char)buf[i];
+        if (c == '\n') {
+          Serial.print("Received: ");
+          Serial.println(inbox);
+          inbox = "";
+        } else {
+          inbox += c;
+          if (inbox.length() > 512) inbox = "";
+        }
+      }
+    }
+  }
+}
+
+
+
+____--------
