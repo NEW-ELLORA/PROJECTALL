@@ -1,0 +1,324 @@
+____________________________________MAC ADDESS FINDER ________________________________
+
+// Simple Diagnostic Receiver - robust across ESP32 Arduino cores
+// Prints MAC (WiFi.macAddress + esp_wifi_get_mac) and reports esp_now init/send results.
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+// Broadcast address
+uint8_t broadcastAddress[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
+const char BEACON_MSG[] = "DIAG_BEACON";
+
+void printHexMac(const uint8_t *mac) {
+  for (int i = 0; i < 6; ++i) {
+    if (mac[i] < 16) Serial.print('0');
+    Serial.print(mac[i], HEX);
+    if (i < 5) Serial.print(':');
+  }
+}
+
+// onSent callback: only prints overall status (safe)
+void onSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  Serial.print("[onSent] status=");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+  (void)info; // don't access fields that may not exist on some cores
+}
+
+// onRecv callback: prints source MAC and payload length
+void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  Serial.print("[onRecv] from ");
+  if (info && info->src_addr) printHexMac(info->src_addr);
+  Serial.print(" len=");
+  Serial.println(len);
+  // print first bytes (safe, do not assume structure)
+  if (len > 0) {
+    Serial.print(" data[0..min(7,len-1)]: ");
+    for (int i = 0; i < len && i < 8; ++i) {
+      if (data[i] < 16) Serial.print('0');
+      Serial.print(data[i], HEX);
+      Serial.print(' ');
+    }
+    Serial.println();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(150);
+  Serial.println("\n=== SIMPLE DIAGNOSTIC ===");
+
+  // Ensure WiFi STA mode
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(50);
+
+  // 1) WiFi.macAddress()
+  String macStr = WiFi.macAddress();
+  Serial.print("WiFi.macAddress(): ");
+  Serial.println(macStr);
+
+  // 2) esp_wifi_get_mac()
+  uint8_t macBuf[6] = {0};
+  esp_err_t e = esp_wifi_get_mac(WIFI_IF_STA, macBuf);
+  Serial.print("esp_wifi_get_mac(WIFI_IF_STA) -> esp_err: ");
+  Serial.println((int)e);
+  Serial.print("esp_wifi_get_mac MAC: ");
+  printHexMac(macBuf);
+  Serial.println();
+
+  // Check "all zero" quickly
+  bool macAllZero = true;
+  for (int i = 0; i < 6; ++i) if (macBuf[i] != 0) macAllZero = false;
+  Serial.print("esp_wifi_get_mac all-zero? ");
+  Serial.println(macAllZero ? "YES" : "NO");
+
+  // 3) Init ESP-NOW and register callbacks
+  esp_err_t en = esp_now_init();
+  Serial.print("esp_now_init() -> ");
+  Serial.println(en == ESP_OK ? "OK" : String("ERR ") + String((int)en));
+
+  esp_now_register_send_cb(onSent);
+  esp_now_register_recv_cb(onRecv);
+
+  // 4) Try one broadcast send and report result
+  esp_err_t sres = esp_now_send(broadcastAddress, (uint8_t*)BEACON_MSG, sizeof(BEACON_MSG));
+  Serial.print("esp_now_send(broadcast) -> ");
+  Serial.println(sres == ESP_OK ? "OK" : String("ERR ") + String((int)sres));
+
+  Serial.println("\n=== DIAGNOSTIC DONE ===");
+  Serial.println("If MAC is all-zero or esp_now_init failed:");
+  Serial.println(" - Ensure Tools->Board matches your module (ESP32 Dev Module or specific variant).");
+  Serial.println(" - Try a full power-cycle (unplug USB / battery) and re-flash.");
+  Serial.println(" - If still failing, update the 'esp32' platform in Boards Manager to the latest stable.");
+}
+
+void loop() {
+  delay(1000);
+}
+____________________________________________________________________________________________________________________________
+
+_______________________________________________receiver code ______________________________________________
+
+/*
+  ESP32 Receiver (BOT) - Updated
+  - Adds broadcast address as an ESP-NOW peer before sending beacons
+  - Uses low-level LEDC (works across cores)
+  - Prints verbose status for esp_now_add_peer and esp_now_send
+*/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <driver/ledc.h>
+
+// ---------------- Pin definitions ----------------
+const uint8_t A_RPWM = 32;
+const uint8_t A_LPWM = 33;
+const uint8_t A_R_EN  = 26;
+const uint8_t A_L_EN  = 25;
+const uint8_t B_RPWM = 12;
+const uint8_t B_LPWM = 13;
+const uint8_t B_R_EN  = 14;
+const uint8_t B_L_EN  = 27;
+
+// ---------------- PWM settings ----------------
+const uint32_t pwmFreq = 500;     // Hz
+const uint8_t pwmResolution = 8;  // bits
+const uint16_t pwmMax = (1 << pwmResolution) - 1; // 255
+
+// LEDC low-level setup
+const ledc_mode_t LEDC_MODE = LEDC_HIGH_SPEED_MODE;
+const ledc_timer_t LEDC_TIMER = LEDC_TIMER_0;
+const ledc_timer_bit_t LEDC_RES = (ledc_timer_bit_t)LEDC_TIMER_8_BIT;
+
+// Channels
+const ledc_channel_t CH_A_R = LEDC_CHANNEL_0;
+const ledc_channel_t CH_A_L = LEDC_CHANNEL_1;
+const ledc_channel_t CH_B_R = LEDC_CHANNEL_2;
+const ledc_channel_t CH_B_L = LEDC_CHANNEL_3;
+
+// ---------------- Motor control helpers ----------------
+uint8_t dutyA_R = 0, dutyA_L = 0, dutyB_R = 0, dutyB_L = 0;
+void applyDuties() {
+  ledc_set_duty(LEDC_MODE, CH_A_R, dutyA_R);  ledc_update_duty(LEDC_MODE, CH_A_R);
+  ledc_set_duty(LEDC_MODE, CH_A_L, dutyA_L);  ledc_update_duty(LEDC_MODE, CH_A_L);
+  ledc_set_duty(LEDC_MODE, CH_B_R, dutyB_R);  ledc_update_duty(LEDC_MODE, CH_B_R);
+  ledc_set_duty(LEDC_MODE, CH_B_L, dutyB_L);  ledc_update_duty(LEDC_MODE, CH_B_L);
+}
+void setMotorOutputs(uint8_t a_r, uint8_t a_l, uint8_t b_r, uint8_t b_l) {
+  dutyA_R = a_r; dutyA_L = a_l; dutyB_R = b_r; dutyB_L = b_l; applyDuties();
+}
+
+void A_rotateClockwise(uint8_t speed = pwmMax) { setMotorOutputs(speed, 0, dutyB_R, dutyB_L); }
+void A_rotateAnticlockwise(uint8_t speed = pwmMax) { setMotorOutputs(0, speed, dutyB_R, dutyB_L); }
+void A_stop() { setMotorOutputs(0, 0, dutyB_R, dutyB_L); }
+
+void B_rotateClockwise(uint8_t speed = pwmMax) { setMotorOutputs(dutyA_R, dutyA_L, speed, 0); }
+void B_rotateAnticlockwise(uint8_t speed = pwmMax) { setMotorOutputs(dutyA_R, dutyA_L, 0, speed); }
+void B_stop() { setMotorOutputs(dutyA_R, dutyA_L, 0, 0); }
+
+void emergencyStop() {
+  setMotorOutputs(0, 0, 0, 0);
+  digitalWrite(A_R_EN, LOW); digitalWrite(A_L_EN, LOW);
+  digitalWrite(B_R_EN, LOW); digitalWrite(B_L_EN, LOW);
+  Serial.println("⚠️ EMERGENCY STOP!");
+}
+void enableDrivers(bool en) {
+  digitalWrite(A_R_EN, en ? HIGH : LOW);
+  digitalWrite(A_L_EN, en ? HIGH : LOW);
+  digitalWrite(B_R_EN, en ? HIGH : LOW);
+  digitalWrite(B_L_EN, en ? HIGH : LOW);
+}
+
+// ---------------- ESP-NOW payload struct ----------------
+typedef struct {
+  int16_t left;   // -255..255
+  int16_t right;  // -255..255
+  uint8_t cmd;    // 0=drive, 1=estop, 2=enable
+} __attribute__((packed)) control_payload_t;
+
+// ---------------- Beacon / peer ----------------
+uint8_t broadcastAddress[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
+const unsigned long BEACON_INTERVAL_MS = 1000;
+unsigned long lastBeacon = 0;
+const char BEACON_MSG[] = "BOT_BEACON";
+
+// ---------------- ESP-NOW callbacks ----------------
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  if (len < (int)sizeof(control_payload_t)) return;
+  control_payload_t p; memcpy(&p, incomingData, sizeof(p));
+  if (p.cmd == 1) { emergencyStop(); return; }
+  if (p.cmd == 2) { enableDrivers(true); Serial.println("✅ Drivers enabled remotely"); return; }
+
+  int16_t l = p.left, r = p.right;
+  if (l > 255) l = 255; if (l < -255) l = -255;
+  if (r > 255) r = 255; if (r < -255) r = -255;
+  if (l > 0) A_rotateClockwise((uint8_t)l);
+  else if (l < 0) A_rotateAnticlockwise((uint8_t)(-l));
+  else A_stop();
+  if (r > 0) B_rotateClockwise((uint8_t)r);
+  else if (r < 0) B_rotateAnticlockwise((uint8_t)(-r));
+  else B_stop();
+}
+
+void onSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  // not used for control; print if you want debugging
+}
+
+// ---------------- LEDC setup ----------------
+void setupLEDC() {
+  ledc_timer_config_t ledc_timer = {
+    .speed_mode       = LEDC_MODE,
+    .duty_resolution  = LEDC_RES,
+    .timer_num        = LEDC_TIMER,
+    .freq_hz          = pwmFreq,
+    .clk_cfg          = LEDC_AUTO_CLK
+  };
+  ledc_timer_config(&ledc_timer);
+
+  auto attachChannel = [&](ledc_channel_t ch, uint8_t pin) {
+    ledc_channel_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.gpio_num   = pin;
+    cfg.speed_mode = LEDC_MODE;
+    cfg.channel    = ch;
+    cfg.intr_type  = LEDC_INTR_DISABLE;
+    cfg.timer_sel  = LEDC_TIMER;
+    cfg.duty       = 0;
+    cfg.hpoint     = 0;
+    ledc_channel_config(&cfg);
+  };
+
+  attachChannel(CH_A_R, A_RPWM);
+  attachChannel(CH_A_L, A_LPWM);
+  attachChannel(CH_B_R, B_RPWM);
+  attachChannel(CH_B_L, B_LPWM);
+}
+
+// ---------------- setup ----------------
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n🚗 Receiver (BOT) - Beacon with broadcast-peer add");
+
+  pinMode(A_R_EN, OUTPUT); pinMode(A_L_EN, OUTPUT);
+  pinMode(B_R_EN, OUTPUT); pinMode(B_L_EN, OUTPUT);
+  enableDrivers(true);
+
+  setupLEDC();
+  setMotorOutputs(0,0,0,0);
+
+  // WiFi + ESP-NOW
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(50);
+
+  Serial.print("Receiver MAC: "); Serial.println(WiFi.macAddress());
+
+  esp_err_t en = esp_now_init();
+  Serial.print("esp_now_init() -> "); Serial.println(en == ESP_OK ? "OK" : String("ERR ") + String((int)en));
+  if (en != ESP_OK) {
+    Serial.println("ESP-NOW init failed — aborting beacon setup.");
+  }
+
+  // register callbacks
+  esp_now_register_recv_cb(onDataRecv);
+  esp_now_register_send_cb(onSent);
+
+  // IMPORTANT: add broadcast as a peer BEFORE sending broadcast messages on some cores
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;       // use current channel (0 means current)
+  peerInfo.encrypt = false;
+
+  esp_err_t addRes = esp_now_add_peer(&peerInfo);
+  Serial.print("esp_now_add_peer(broadcast) -> ");
+  Serial.println((int)addRes);
+  if (addRes == ESP_OK) {
+    Serial.println("Broadcast peer added OK.");
+  } else if (addRes == ESP_ERR_ESPNOW_NOT_INIT) {
+    Serial.println("ERR: ESP-NOW not initialized.");
+  } else if (addRes == ESP_ERR_ESPNOW_ARG) {
+    Serial.println("ERR: Invalid arg when adding peer.");
+  } else if (addRes == ESP_ERR_ESPNOW_NO_MEM) {
+    Serial.println("ERR: No memory to add peer.");
+  } else {
+    Serial.println("Note: add_peer returned code (see numeric). Continuing and will attempt send.");
+  }
+
+  Serial.println("Setup complete. Beaconing will start...");
+}
+
+// ---------------- loop ----------------
+void loop() {
+  unsigned long now = millis();
+  if (now - lastBeacon >= BEACON_INTERVAL_MS) {
+    lastBeacon = now;
+    esp_err_t sres = esp_now_send(broadcastAddress, (uint8_t*)BEACON_MSG, sizeof(BEACON_MSG));
+    Serial.print("esp_now_send(broadcast) -> "); Serial.println((int)sres);
+    if (sres == ESP_OK) {
+      // success
+    } else if (sres == ESP_ERR_ESPNOW_NOT_FOUND || sres == 12393) {
+      Serial.println("ERR 12393: Peer not added / Master not added yet. Ensure broadcast peer was added.");
+    } else {
+      Serial.println("esp_now_send returned numeric code above (check).");
+    }
+  }
+  delay(10);
+}
+
+__________________________________________________________________________________________________________________________
+
+__________________________________ Transmitter code____________________________________________________________________
+
+
+
+
+
+
+
