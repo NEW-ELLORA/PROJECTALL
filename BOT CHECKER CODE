@@ -1,0 +1,148 @@
+// ---------------- Pin definitions ----------------
+// Motor A (BTS #1)
+const uint8_t A_RPWM = 32;
+const uint8_t A_LPWM = 33;
+const uint8_t A_R_EN = 26;
+const uint8_t A_L_EN = 25;
+
+// Motor B (BTS #2)
+const uint8_t B_RPWM = 12;
+const uint8_t B_LPWM = 13;
+const uint8_t B_R_EN = 14;
+const uint8_t B_L_EN = 27;
+
+// ---------------- PWM settings ----------------
+const unsigned long pwmFreq = 500;     // Hz (try 200-1000)
+const uint16_t pwmResolution = 255;    // duty scale 0..255
+const unsigned long pwmPeriodUs = 1000000UL / pwmFreq; // period in microseconds
+
+// ---------------- Soft PWM channel structure ----------------
+struct SoftPWMChannel {
+  uint8_t pin;
+  uint8_t duty; // 0..pwmResolution
+};
+
+SoftPWMChannel chA_R = { A_RPWM, 0 };
+SoftPWMChannel chA_L = { A_LPWM, 0 };
+SoftPWMChannel chB_R = { B_RPWM, 0 };
+SoftPWMChannel chB_L = { B_LPWM, 0 };
+
+// Convenience array for updates (keeps code concise)
+SoftPWMChannel* channels[4] = { &chA_R, &chA_L, &chB_R, &chB_L };
+
+// ---------------- setup ----------------
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Two-BTS software PWM example");
+
+  // Configure PWM pins
+  pinMode(A_RPWM, OUTPUT);
+  pinMode(A_LPWM, OUTPUT);
+  pinMode(B_RPWM, OUTPUT);
+  pinMode(B_LPWM, OUTPUT);
+
+  // Configure enable pins
+  pinMode(A_R_EN, OUTPUT);
+  pinMode(A_L_EN, OUTPUT);
+  pinMode(B_R_EN, OUTPUT);
+  pinMode(B_L_EN, OUTPUT);
+
+  // Enable drivers (most modules are active-HIGH)
+  digitalWrite(A_R_EN, HIGH);
+  digitalWrite(A_L_EN, HIGH);
+  digitalWrite(B_R_EN, HIGH);
+  digitalWrite(B_L_EN, HIGH);
+
+  // Ensure outputs start LOW
+  for (int i = 0; i < 4; ++i) digitalWrite(channels[i]->pin, LOW);
+}
+
+// ---------------- Soft PWM core (call frequently) ----------------
+void softPwmUpdate() {
+  unsigned long now = micros();
+  unsigned long phase = now % pwmPeriodUs;
+  // Update each channel
+  for (int i = 0; i < 4; ++i) {
+    SoftPWMChannel* ch = channels[i];
+    unsigned long onTime = (unsigned long)ch->duty * pwmPeriodUs / pwmResolution;
+    digitalWrite(ch->pin, (phase < onTime) ? HIGH : LOW);
+  }
+}
+
+// ---------------- Utility: set duty ----------------
+void setDuty(SoftPWMChannel &ch, uint8_t duty) {
+  if (duty > pwmResolution) duty = pwmResolution;
+  ch.duty = duty;
+}
+
+// ---------------- Motor-level helpers ----------------
+// Motor A control
+void A_rotateClockwise(uint8_t speed = pwmResolution) {
+  setDuty(chA_R, speed);
+  setDuty(chA_L, 0);
+}
+void A_rotateAnticlockwise(uint8_t speed = pwmResolution) {
+  setDuty(chA_R, 0);
+  setDuty(chA_L, speed);
+}
+void A_stop() {
+  setDuty(chA_R, 0);
+  setDuty(chA_L, 0);
+}
+
+// Motor B control
+void B_rotateClockwise(uint8_t speed = pwmResolution) {
+  setDuty(chB_R, speed);
+  setDuty(chB_L, 0);
+}
+void B_rotateAnticlockwise(uint8_t speed = pwmResolution) {
+  setDuty(chB_R, 0);
+  setDuty(chB_L, speed);
+}
+void B_stop() {
+  setDuty(chB_R, 0);
+  setDuty(chB_L, 0);
+}
+
+// ---------------- Demo helpers ----------------
+void waitWithPwm(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    softPwmUpdate();
+    delay(1); // tiny sleep to reduce CPU usage — keeps PWM accurate
+  }
+}
+
+// ---------------- main loop (demo) ----------------
+void loop() {
+  Serial.println("Both motors: Clockwise (3s)");
+  // Example: both motors clockwise
+  A_rotateClockwise();
+  B_rotateClockwise();
+  waitWithPwm(2000);
+
+  Serial.println("Stop (1s)");
+  A_stop();
+  B_stop();
+  waitWithPwm(1000);
+
+  Serial.println("Motor A: Anticlockwise, Motor B: Clockwise (3s)");
+  A_rotateAnticlockwise();
+  B_rotateClockwise();
+  waitWithPwm(2000);
+
+  Serial.println("Stop (1s)");
+  A_stop();
+  B_stop();
+  waitWithPwm(1000);
+
+  Serial.println("Motor A: Clockwise, Motor B: Anticlockwise (3s)");
+  A_rotateClockwise();
+  B_rotateAnticlockwise();
+  waitWithPwm(2000);
+
+  Serial.println("Stop (1s)");
+  A_stop();
+  B_stop();
+  waitWithPwm(1000);
+}
