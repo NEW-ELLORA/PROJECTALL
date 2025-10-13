@@ -102,220 +102,230 @@ ________________________________________________________________________________
 
 _______________________________________________receiver code ______________________________________________
 
-/*
-  ESP32 Receiver (BOT) - Updated
-  - Adds broadcast address as an ESP-NOW peer before sending beacons
-  - Uses low-level LEDC (works across cores)
-  - Prints verbose status for esp_now_add_peer and esp_now_send
-*/
-
-#include <Arduino.h>
-#include <WiFi.h>
 #include <esp_now.h>
-#include <esp_wifi.h>
-#include <driver/ledc.h>
+#include <WiFi.h>
 
-// ---------------- Pin definitions ----------------
+// Motor A connections
 const uint8_t A_RPWM = 32;
 const uint8_t A_LPWM = 33;
 const uint8_t A_R_EN  = 26;
 const uint8_t A_L_EN  = 25;
+
+// Motor B connections
 const uint8_t B_RPWM = 12;
 const uint8_t B_LPWM = 13;
 const uint8_t B_R_EN  = 14;
 const uint8_t B_L_EN  = 27;
 
-// ---------------- PWM settings ----------------
-const uint32_t pwmFreq = 500;     // Hz
-const uint8_t pwmResolution = 8;  // bits
-const uint16_t pwmMax = (1 << pwmResolution) - 1; // 255
+// Structure to receive data (must match sender)
+typedef struct struct_message {
+  int command;
+} struct_message;
 
-// LEDC low-level setup
-const ledc_mode_t LEDC_MODE = LEDC_HIGH_SPEED_MODE;
-const ledc_timer_t LEDC_TIMER = LEDC_TIMER_0;
-const ledc_timer_bit_t LEDC_RES = (ledc_timer_bit_t)LEDC_TIMER_8_BIT;
+struct_message myData;
 
-// Channels
-const ledc_channel_t CH_A_R = LEDC_CHANNEL_0;
-const ledc_channel_t CH_A_L = LEDC_CHANNEL_1;
-const ledc_channel_t CH_B_R = LEDC_CHANNEL_2;
-const ledc_channel_t CH_B_L = LEDC_CHANNEL_3;
+// Callback when data is received — updated signature
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  // optional: print sender MAC
+  Serial.print("From MAC: ");
+  for (int i = 0; i < 6; i++) {
+    if (info->src_addr[i] < 0x10) Serial.print("0");
+    Serial.print(info->src_addr[i], HEX);
+    if (i < 5) Serial.print(":");
+  }
+  Serial.println();
 
-// ---------------- Motor control helpers ----------------
-uint8_t dutyA_R = 0, dutyA_L = 0, dutyB_R = 0, dutyB_L = 0;
-void applyDuties() {
-  ledc_set_duty(LEDC_MODE, CH_A_R, dutyA_R);  ledc_update_duty(LEDC_MODE, CH_A_R);
-  ledc_set_duty(LEDC_MODE, CH_A_L, dutyA_L);  ledc_update_duty(LEDC_MODE, CH_A_L);
-  ledc_set_duty(LEDC_MODE, CH_B_R, dutyB_R);  ledc_update_duty(LEDC_MODE, CH_B_R);
-  ledc_set_duty(LEDC_MODE, CH_B_L, dutyB_L);  ledc_update_duty(LEDC_MODE, CH_B_L);
-}
-void setMotorOutputs(uint8_t a_r, uint8_t a_l, uint8_t b_r, uint8_t b_l) {
-  dutyA_R = a_r; dutyA_L = a_l; dutyB_R = b_r; dutyB_L = b_l; applyDuties();
-}
-
-void A_rotateClockwise(uint8_t speed = pwmMax) { setMotorOutputs(speed, 0, dutyB_R, dutyB_L); }
-void A_rotateAnticlockwise(uint8_t speed = pwmMax) { setMotorOutputs(0, speed, dutyB_R, dutyB_L); }
-void A_stop() { setMotorOutputs(0, 0, dutyB_R, dutyB_L); }
-
-void B_rotateClockwise(uint8_t speed = pwmMax) { setMotorOutputs(dutyA_R, dutyA_L, speed, 0); }
-void B_rotateAnticlockwise(uint8_t speed = pwmMax) { setMotorOutputs(dutyA_R, dutyA_L, 0, speed); }
-void B_stop() { setMotorOutputs(dutyA_R, dutyA_L, 0, 0); }
-
-void emergencyStop() {
-  setMotorOutputs(0, 0, 0, 0);
-  digitalWrite(A_R_EN, LOW); digitalWrite(A_L_EN, LOW);
-  digitalWrite(B_R_EN, LOW); digitalWrite(B_L_EN, LOW);
-  Serial.println("⚠️ EMERGENCY STOP!");
-}
-void enableDrivers(bool en) {
-  digitalWrite(A_R_EN, en ? HIGH : LOW);
-  digitalWrite(A_L_EN, en ? HIGH : LOW);
-  digitalWrite(B_R_EN, en ? HIGH : LOW);
-  digitalWrite(B_L_EN, en ? HIGH : LOW);
+  // safety: check size before memcpy
+  if (len == sizeof(myData)) {
+    memcpy(&myData, incomingData, len);
+    Serial.print("Command received: ");
+    Serial.println(myData.command);
+  } else {
+    Serial.print("Unexpected data length: ");
+    Serial.println(len);
+  }
 }
 
-// ---------------- ESP-NOW payload struct ----------------
-typedef struct {
-  int16_t left;   // -255..255
-  int16_t right;  // -255..255
-  uint8_t cmd;    // 0=drive, 1=estop, 2=enable
-} __attribute__((packed)) control_payload_t;
-
-// ---------------- Beacon / peer ----------------
-uint8_t broadcastAddress[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
-const unsigned long BEACON_INTERVAL_MS = 1000;
-unsigned long lastBeacon = 0;
-const char BEACON_MSG[] = "BOT_BEACON";
-
-// ---------------- ESP-NOW callbacks ----------------
-void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
-  if (len < (int)sizeof(control_payload_t)) return;
-  control_payload_t p; memcpy(&p, incomingData, sizeof(p));
-  if (p.cmd == 1) { emergencyStop(); return; }
-  if (p.cmd == 2) { enableDrivers(true); Serial.println("✅ Drivers enabled remotely"); return; }
-
-  int16_t l = p.left, r = p.right;
-  if (l > 255) l = 255; if (l < -255) l = -255;
-  if (r > 255) r = 255; if (r < -255) r = -255;
-  if (l > 0) A_rotateClockwise((uint8_t)l);
-  else if (l < 0) A_rotateAnticlockwise((uint8_t)(-l));
-  else A_stop();
-  if (r > 0) B_rotateClockwise((uint8_t)r);
-  else if (r < 0) B_rotateAnticlockwise((uint8_t)(-r));
-  else B_stop();
-}
-
-void onSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
-  // not used for control; print if you want debugging
-}
-
-// ---------------- LEDC setup ----------------
-void setupLEDC() {
-  ledc_timer_config_t ledc_timer = {
-    .speed_mode       = LEDC_MODE,
-    .duty_resolution  = LEDC_RES,
-    .timer_num        = LEDC_TIMER,
-    .freq_hz          = pwmFreq,
-    .clk_cfg          = LEDC_AUTO_CLK
-  };
-  ledc_timer_config(&ledc_timer);
-
-  auto attachChannel = [&](ledc_channel_t ch, uint8_t pin) {
-    ledc_channel_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.gpio_num   = pin;
-    cfg.speed_mode = LEDC_MODE;
-    cfg.channel    = ch;
-    cfg.intr_type  = LEDC_INTR_DISABLE;
-    cfg.timer_sel  = LEDC_TIMER;
-    cfg.duty       = 0;
-    cfg.hpoint     = 0;
-    ledc_channel_config(&cfg);
-  };
-
-  attachChannel(CH_A_R, A_RPWM);
-  attachChannel(CH_A_L, A_LPWM);
-  attachChannel(CH_B_R, B_RPWM);
-  attachChannel(CH_B_L, B_LPWM);
-}
-
-// ---------------- setup ----------------
 void setup() {
   Serial.begin(115200);
-  delay(100);
-  Serial.println("\n🚗 Receiver (BOT) - Beacon with broadcast-peer add");
 
-  pinMode(A_R_EN, OUTPUT); pinMode(A_L_EN, OUTPUT);
-  pinMode(B_R_EN, OUTPUT); pinMode(B_L_EN, OUTPUT);
-  enableDrivers(true);
-
-  setupLEDC();
-  setMotorOutputs(0,0,0,0);
-
-  // WiFi + ESP-NOW
+  // Station mode for ESP-NOW
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(50);
+  delay(100);
 
-  Serial.print("Receiver MAC: "); Serial.println(WiFi.macAddress());
-
-  esp_err_t en = esp_now_init();
-  Serial.print("esp_now_init() -> "); Serial.println(en == ESP_OK ? "OK" : String("ERR ") + String((int)en));
-  if (en != ESP_OK) {
-    Serial.println("ESP-NOW init failed — aborting beacon setup.");
+  // Init ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
   }
 
-  // register callbacks
-  esp_now_register_recv_cb(onDataRecv);
-  esp_now_register_send_cb(onSent);
+  // Register receive callback
+  esp_now_register_recv_cb(OnDataRecv);
 
-  // IMPORTANT: add broadcast as a peer BEFORE sending broadcast messages on some cores
-  esp_now_peer_info_t peerInfo;
-  memset(&peerInfo, 0, sizeof(peerInfo));
-  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 0;       // use current channel (0 means current)
-  peerInfo.encrypt = false;
+  // Motor pins
+  pinMode(A_RPWM, OUTPUT);
+  pinMode(A_LPWM, OUTPUT);
+  pinMode(A_R_EN, OUTPUT);
+  pinMode(A_L_EN, OUTPUT);
+  pinMode(B_RPWM, OUTPUT);
+  pinMode(B_LPWM, OUTPUT);
+  pinMode(B_R_EN, OUTPUT);
+  pinMode(B_L_EN, OUTPUT);
 
-  esp_err_t addRes = esp_now_add_peer(&peerInfo);
-  Serial.print("esp_now_add_peer(broadcast) -> ");
-  Serial.println((int)addRes);
-  if (addRes == ESP_OK) {
-    Serial.println("Broadcast peer added OK.");
-  } else if (addRes == ESP_ERR_ESPNOW_NOT_INIT) {
-    Serial.println("ERR: ESP-NOW not initialized.");
-  } else if (addRes == ESP_ERR_ESPNOW_ARG) {
-    Serial.println("ERR: Invalid arg when adding peer.");
-  } else if (addRes == ESP_ERR_ESPNOW_NO_MEM) {
-    Serial.println("ERR: No memory to add peer.");
-  } else {
-    Serial.println("Note: add_peer returned code (see numeric). Continuing and will attempt send.");
-  }
+  // Start with motors disabled/stopped
+  digitalWrite(A_RPWM, LOW);
+  digitalWrite(A_LPWM, LOW);
+  digitalWrite(B_RPWM, LOW);
+  digitalWrite(B_LPWM, LOW);
 
-  Serial.println("Setup complete. Beaconing will start...");
+  // Enable motors (verify active-high on your driver)
+  digitalWrite(A_R_EN, HIGH);
+  digitalWrite(A_L_EN, HIGH);
+  digitalWrite(B_R_EN, HIGH);
+  digitalWrite(B_L_EN, HIGH);
 }
 
-// ---------------- loop ----------------
 void loop() {
-  unsigned long now = millis();
-  if (now - lastBeacon >= BEACON_INTERVAL_MS) {
-    lastBeacon = now;
-    esp_err_t sres = esp_now_send(broadcastAddress, (uint8_t*)BEACON_MSG, sizeof(BEACON_MSG));
-    Serial.print("esp_now_send(broadcast) -> "); Serial.println((int)sres);
-    if (sres == ESP_OK) {
-      // success
-    } else if (sres == ESP_ERR_ESPNOW_NOT_FOUND || sres == 12393) {
-      Serial.println("ERR 12393: Peer not added / Master not added yet. Ensure broadcast peer was added.");
-    } else {
-      Serial.println("esp_now_send returned numeric code above (check).");
-    }
+  switch (myData.command) {
+    case 1: // Forward (all motors anticlockwise)
+      digitalWrite(A_LPWM, HIGH);
+      digitalWrite(A_RPWM, LOW);
+      digitalWrite(B_LPWM, HIGH);
+      digitalWrite(B_RPWM, LOW);
+      break;
+    case 2: // Backward (all motors clockwise)
+      digitalWrite(A_LPWM, LOW);
+      digitalWrite(A_RPWM, HIGH);
+      digitalWrite(B_LPWM, LOW);
+      digitalWrite(B_RPWM, HIGH);
+      break;
+    case 3: // Right (left motor anticlockwise, right motor clockwise)
+      digitalWrite(A_LPWM, HIGH);
+      digitalWrite(A_RPWM, LOW);
+      digitalWrite(B_LPWM, LOW);
+      digitalWrite(B_RPWM, HIGH);
+      break;
+    case 4: // Left (left motor clockwise, right motor anticlockwise)
+      digitalWrite(A_LPWM, LOW);
+      digitalWrite(A_RPWM, HIGH);
+      digitalWrite(B_LPWM, HIGH);
+      digitalWrite(B_RPWM, LOW);
+      break;
+    default: // Stop
+      digitalWrite(A_LPWM, LOW);
+      digitalWrite(A_RPWM, LOW);
+      digitalWrite(B_LPWM, LOW);
+      digitalWrite(B_RPWM, LOW);
+      break;
   }
-  delay(10);
+
+  // small delay to avoid busy-loop printing jitter
+  delay(20);
 }
 
 __________________________________________________________________________________________________________________________
 
 __________________________________ Transmitter code____________________________________________________________________
 
+#include <esp_now.h>
+#include <WiFi.h>
+
+// Replace with the MAC address of your receiver ESP32
+uint8_t broadcastAddress[] = {0x98, 0xF4, 0xAB, 0x09, 0x61, 0xB4};
+
+// Define the joystick pins
+const int VRX_PIN = 34;
+const int VRY_PIN = 35;
+const int SW_PIN  = 32;
+
+// Structure to send data (must match receiver)
+typedef struct struct_message {
+  int command;
+} struct_message;
+
+// Create a struct_message called myData
+struct_message myData;
+
+esp_now_peer_info_t peerInfo;
+
+// New-style callback expected by newer ESP32 cores/IDF
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  Serial.print("\r\nLast Packet Send Status:\t");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+  // Avoid depending on fields in wifi_tx_info_t unless you inspect your core headers.
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Set device as a Wi-Fi Station
+  WiFi.mode(WIFI_STA);
+
+  // Init ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  // Register send callback (matches new signature)
+  esp_now_register_send_cb(OnDataSent);
+
+  // Register peer
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;    // use current WiFi channel
+  peerInfo.encrypt = false;
+
+  // Add peer
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  pinMode(VRX_PIN, INPUT);
+  pinMode(VRY_PIN, INPUT);
+  pinMode(SW_PIN, INPUT_PULLUP);
+
+  Serial.println("Setup complete");
+}
+
+void loop() {
+  int xValue = analogRead(VRX_PIN);
+  int yValue = analogRead(VRY_PIN);
+  int swValue = digitalRead(SW_PIN);
+
+  // Diagnostic prints
+  Serial.print("X Value: ");
+  Serial.print(xValue);
+  Serial.print(" | Y Value: ");
+  Serial.print(yValue);
+
+  // Deadband for the joystick to prevent drift (ESP32 ADC is 0-4095)
+  if (yValue < 1000) {
+    myData.command = 1; // Forward
+  } else if (yValue > 3000) {
+    myData.command = 2; // Backward
+  } else if (xValue > 3000) {
+    myData.command = 3; // Right
+  } else if (xValue < 1000) {
+    myData.command = 4; // Left
+  } else {
+    myData.command = 0; // Stop
+  }
+
+  Serial.print(" | Command Sent: ");
+  Serial.println(myData.command);
+
+  // Send message via ESP-NOW
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&myData, sizeof(myData));
+
+  if (result != ESP_OK) {
+    Serial.print("Error sending the data: ");
+    Serial.println(result);
+  }
+
+  delay(200);
+}
 
 
 
