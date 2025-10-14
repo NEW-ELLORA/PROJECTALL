@@ -1,0 +1,139 @@
+_________________________________________Transmitter code______________________________________________
+// Transmitter: ESP32 + PS2 joystick + nRF24L01+PA+LNA (adapter board)
+// Pins: CE=13, CSN=25, SCK=14, MISO=26, MOSI=27
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+
+#define CE_PIN   13
+#define CSN_PIN  25
+
+// SPI pins: SCK, MISO, MOSI, SS(CSN)
+const int SPI_SCK  = 14;
+const int SPI_MISO = 26;
+const int SPI_MOSI = 27;
+const int SPI_SS   = CSN_PIN;
+
+RF24 radio(CE_PIN, CSN_PIN);
+const byte txAddress[6] = "NODE1";
+
+const int VRX_PIN = 34; // joystick X (ADC1)
+const int VRY_PIN = 35; // joystick Y (ADC1)
+
+const int ADC_CENTER = 2048;
+const int DEADZONE = 400;   // adjust to taste
+const int SAMPLE_MS = 80;   // sampling interval
+
+uint8_t lastSentAngle = 255;
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // Initialize SPI on custom pins BEFORE radio.begin()
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SPI_SS);
+
+  radio.begin();
+  radio.setPALevel(RF24_PA_HIGH);   // using PA+LNA module
+  radio.setChannel(108);            // change if you see interference
+  radio.setDataRate(RF24_1MBPS);
+  radio.openWritingPipe(txAddress);
+  radio.stopListening();
+
+  Serial.println("Transmitter ready");
+}
+
+uint8_t axisToAngle(int xVal, int yVal) {
+  int dx = xVal - ADC_CENTER;
+  int dy = yVal - ADC_CENTER;
+
+  if (abs(dx) < DEADZONE && abs(dy) < DEADZONE) {
+    return 255; // no direction / center
+  }
+
+  // choose dominant axis (preference to the larger absolute deflection)
+  if (abs(dx) > abs(dy)) {
+    if (dx < 0) return 180; // left
+    else return 0;         // right
+  } else {
+    if (dy < 0) return 90;  // up
+    else return 45;         // down
+  }
+}
+
+void loop() {
+  int x = analogRead(VRX_PIN); // 0 - 4095
+  int y = analogRead(VRY_PIN);
+
+  uint8_t angle = axisToAngle(x, y);
+  if (angle != 255 && angle != lastSentAngle) {
+    bool ok = radio.write(&angle, sizeof(angle));
+    if (ok) {
+      Serial.print("Sent angle: ");
+      Serial.println(angle);
+      lastSentAngle = angle;
+    } else {
+      Serial.println("Send failed");
+    }
+  }
+  delay(SAMPLE_MS);
+}
+_________________________________________________________________________________________________________________________
+
+______________________________________Receiver code _________________________________________________________
+
+// Receiver: ESP32 + nRF24L01+PA+LNA (adapter board) + Servo
+// Pins: CE=13, CSN=25, SCK=14, MISO=26, MOSI=27
+// Servo signal pin: GPIO32 (no conflict with CE)
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include <ESP32Servo.h> // install via Library Manager if needed
+
+#define CE_PIN   13
+#define CSN_PIN  25
+
+// SPI pins: SCK, MISO, MOSI, SS(CSN)
+const int SPI_SCK  = 14;
+const int SPI_MISO = 26;
+const int SPI_MOSI = 27;
+const int SPI_SS   = CSN_PIN;
+
+RF24 radio(CE_PIN, CSN_PIN);
+const byte rxAddress[6] = "NODE1";
+
+const int SERVO_PIN = 32; // changed to avoid conflict with CE
+Servo myServo;
+uint8_t incomingAngle = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  myServo.attach(SERVO_PIN);
+  myServo.write(90); // initial position
+
+  // Initialize SPI on custom pins BEFORE radio.begin()
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SPI_SS);
+
+  radio.begin();
+  radio.setPALevel(RF24_PA_HIGH); // PA+LNA
+  radio.setChannel(108);
+  radio.setDataRate(RF24_1MBPS);
+  radio.openReadingPipe(0, rxAddress);
+  radio.startListening();
+
+  Serial.println("Receiver ready");
+}
+
+void loop() {
+  if (radio.available()) {
+    radio.read(&incomingAngle, sizeof(incomingAngle));
+    Serial.print("Received angle: ");
+    Serial.println(incomingAngle);
+    if (incomingAngle <= 180) {
+      myServo.write(incomingAngle);
+    }
+  }
+  delay(20);
+}
