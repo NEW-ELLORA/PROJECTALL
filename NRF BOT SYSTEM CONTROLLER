@@ -138,21 +138,45 @@ const int LPWM = 33;
 const int R_EN = 22;
 const int L_EN = 23;
 
+const int RPWM1 = 5;
+const int LPWM1 = 17;
+const int R_EN1 = 18;
+const int L_EN1 = 19;
+
 void motorStop() {
   digitalWrite(RPWM, LOW);
   digitalWrite(LPWM, LOW);
+  digitalWrite(RPWM1, LOW);
+  digitalWrite(LPWM1, LOW);
 }
 
 void motorClockwise() {
-  digitalWrite(RPWM, HIGH);
-  digitalWrite(LPWM, LOW);
+  digitalWrite(RPWM, LOW);
+  digitalWrite(LPWM, HIGH);
+  digitalWrite(RPWM1, HIGH);
+  digitalWrite(LPWM1, LOW);
 }
 
 void motorAntiClockwise() {
-  digitalWrite(RPWM, LOW);
-  digitalWrite(LPWM, HIGH);
+  digitalWrite(RPWM, HIGH);
+  digitalWrite(LPWM, LOW);
+  digitalWrite(RPWM1, LOW);
+  digitalWrite(LPWM1, HIGH);
 }
 
+void Clockwise() {
+  digitalWrite(RPWM, HIGH);
+  digitalWrite(LPWM, LOW);
+  digitalWrite(RPWM1, HIGH);
+  digitalWrite(LPWM1, LOW);
+}
+
+void AntiClockwise() {
+  digitalWrite(RPWM, LOW);
+  digitalWrite(LPWM, HIGH);
+  digitalWrite(RPWM1, LOW);
+  digitalWrite(LPWM1, HIGH);
+}
 void setup() {
   Serial.begin(115200);
 
@@ -161,8 +185,15 @@ void setup() {
   pinMode(R_EN, OUTPUT);
   pinMode(L_EN, OUTPUT);
 
+  pinMode(RPWM1, OUTPUT);
+  pinMode(LPWM1, OUTPUT);
+  pinMode(R_EN1, OUTPUT);
+  pinMode(L_EN1, OUTPUT);
+
   digitalWrite(R_EN, HIGH);
   digitalWrite(L_EN, HIGH);
+  digitalWrite(R_EN1, HIGH);
+  digitalWrite(L_EN1, HIGH);
   motorStop();
 
   SPI.begin(14, 26, 27, CSN_PIN);
@@ -189,7 +220,7 @@ void loop() {
 
       case DIR_LEFT:
         Serial.println("LEFT → Anti-Clockwise");
-        motorAntiClockwise();
+        AntiClockwise();
         break;
 
       case DIR_BACKWARD:
@@ -199,7 +230,7 @@ void loop() {
 
       case DIR_RIGHT:
         Serial.println("RIGHT → Clockwise");
-        motorClockwise();
+        Clockwise();
         break;
 
       default:
@@ -209,6 +240,7 @@ void loop() {
     }
   }
 }
+
 
 ___________________________________________________________________________________________________________________
 _______________________ Calibration PS2CONTROLLER MODULE _______________________________________________
