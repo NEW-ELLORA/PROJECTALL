@@ -330,5 +330,453 @@ void loop() {
 
 
 
+-----------------------
 
+// =====================================================
+// ESP32 + PS2 JOYSTICK + ESP-NOW TRANSMITTER (STABLE)
+// CALIBRATION + RC MIXING + BUZZER (NON-BLOCKING)
+// =====================================================
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ================= RECEIVER MAC =================
+uint8_t receiverMac[] = {0x98, 0xF4, 0xAB, 0x09, 0x61, 0xB4};
+
+// ================= BUZZER =================
+#define BUZZER_PIN 4
+
+// ================= JOYSTICK PINS =================
+#define VRX_PIN 34
+#define VRY_PIN 35
+#define BTN_PIN 32
+
+#define ADC_MAX 4095
+#define OUT_MAX 1000
+
+// ================= CALIBRATION ZONES =================
+#define DEADZONE        400
+#define RECENTER_ZONE   250
+#define SNAP_ZERO       80
+#define FILTER_ALPHA    0.2
+
+float fx = 0, fy = 0;
+int centerX = 0, centerY = 0;
+
+// ================= DATA STRUCT =================
+typedef struct struct_message {
+  int motorA;
+  int motorB;
+  int button;
+} struct_message;
+
+struct_message txData;
+
+// ================= LINK / BUZZER STATE =================
+bool linkConfirmed = false;
+bool linkBeepActive = false;
+unsigned long linkBeepStart = 0;
+
+// ================= STABLE ADC =================
+int readStableADC(int pin) {
+  long sum = 0;
+  for (int i = 0; i < 12; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(150);
+  }
+  return sum / 12;
+}
+
+// ================= BUZZER HELPERS =================
+void beep(uint16_t ms) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(ms);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ================= ESP-NOW SEND CALLBACK =================
+void onDataSent(const wifi_tx_info_t *info,
+                esp_now_send_status_t status) {
+
+  if (status == ESP_NOW_SEND_SUCCESS && !linkConfirmed) {
+    linkConfirmed = true;
+    linkBeepActive = true;
+    linkBeepStart = millis();
+    digitalWrite(BUZZER_PIN, HIGH);   // start beep
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(BTN_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  analogReadResolution(12);
+
+  // -------- POWER ON BEEP --------
+  beep(150); delay(150); beep(150);
+
+  // -------- AUTO CALIBRATION (UNCHANGED) --------
+  long sx = 0, sy = 0;
+  for (int i = 0; i < 200; i++) {
+    sx += analogRead(VRX_PIN);
+    sy += analogRead(VRY_PIN);
+    delay(5);
+  }
+
+  centerX = sx / 200;
+  centerY = sy / 200;
+  fx = centerX;
+  fy = centerY;
+
+  // -------- ESP-NOW INIT --------
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init FAILED");
+    while (1);
+  }
+
+  esp_now_register_send_cb(onDataSent);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMac, 6);
+  peerInfo.channel = 0;      // MUST match receiver
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Peer add FAILED");
+    while (1);
+  }
+
+  Serial.println("ESP-NOW Transmitter READY");
+}
+
+// ================= LOOP =================
+void loop() {
+  // -------- HANDLE LINK BEEP (NON-BLOCKING) --------
+  if (linkBeepActive && millis() - linkBeepStart >= 2000) {
+    digitalWrite(BUZZER_PIN, LOW);
+    linkBeepActive = false;
+  }
+
+  int rawX = readStableADC(VRX_PIN);
+  int rawY = readStableADC(VRY_PIN);
+
+  fx += FILTER_ALPHA * (rawX - fx);
+  fy += FILTER_ALPHA * (rawY - fy);
+
+  int dx = (int)fx - centerX;
+  int dy = (int)fy - centerY;
+
+  if (abs(dx) < RECENTER_ZONE && abs(dy) < RECENTER_ZONE) {
+    centerX = (centerX * 99 + fx) / 100;
+    centerY = (centerY * 99 + fy) / 100;
+  }
+
+  int up = 0, down = 0, left = 0, right = 0;
+
+  if (abs(dy) > DEADZONE) {
+    int v = map(abs(dy), DEADZONE, ADC_MAX / 2, 0, OUT_MAX);
+    if (dy < 0) up = v; else down = v;
+  }
+
+  if (abs(dx) > DEADZONE) {
+    int v = map(abs(dx), DEADZONE, ADC_MAX / 2, 0, OUT_MAX);
+    if (dx < 0) left = v; else right = v;
+  }
+
+  if (up < SNAP_ZERO) up = 0;
+  if (down < SNAP_ZERO) down = 0;
+  if (left < SNAP_ZERO) left = 0;
+  if (right < SNAP_ZERO) right = 0;
+
+  // -------- RC DIAGONAL MIXING --------
+  int throttle = up - down;
+  int steering = right - left;
+
+  txData.motorA = constrain(throttle + steering, -OUT_MAX, OUT_MAX);
+  txData.motorB = constrain(throttle - steering, -OUT_MAX, OUT_MAX);
+  txData.button = (digitalRead(BTN_PIN) == LOW);
+
+  esp_now_send(receiverMac, (uint8_t *)&txData, sizeof(txData));
+
+  delay(60);
+}
+-------------------------
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ================= DATA STRUCT =================
+typedef struct struct_message {
+  int motorA;   // -1000 to +1000
+  int motorB;   // -1000 to +1000
+  int button;
+} struct_message;
+
+struct_message rxData;
+
+// ================= MOTOR PINS =================
+// Motor A
+const uint8_t A_RPWM = 32;
+const uint8_t A_LPWM = 33;
+const uint8_t A_R_EN = 26;
+const uint8_t A_L_EN = 25;
+
+// Motor B
+const uint8_t B_RPWM = 12;
+const uint8_t B_LPWM = 13;
+const uint8_t B_R_EN = 14;
+const uint8_t B_L_EN = 27;
+
+// ================= MOTOR DRIVER =================
+void driveMotor(uint8_t rpwm, uint8_t lpwm,
+                uint8_t ren,  uint8_t len,
+                int speed) {
+
+  speed = constrain(speed, -1000, 1000);
+  int pwm = map(abs(speed), 0, 1000, 0, 255);
+
+  digitalWrite(ren, HIGH);
+  digitalWrite(len, HIGH);
+
+  if (speed > 0) {
+    analogWrite(rpwm, pwm);
+    analogWrite(lpwm, 0);
+  }
+  else if (speed < 0) {
+    analogWrite(rpwm, 0);
+    analogWrite(lpwm, pwm);
+  }
+  else {
+    analogWrite(rpwm, 0);
+    analogWrite(lpwm, 0);
+  }
+}
+
+// ================= ESP-NOW RX CALLBACK =================
+void onDataRecv(const esp_now_recv_info *info,
+                const uint8_t *incomingData,
+                int len) {
+
+  if (len != sizeof(struct_message)) return;
+
+  memcpy(&rxData, incomingData, sizeof(rxData));
+
+  driveMotor(A_RPWM, A_LPWM, A_R_EN, A_L_EN, rxData.motorA);
+  driveMotor(B_RPWM, B_LPWM, B_R_EN, B_L_EN, rxData.motorB);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(A_RPWM, OUTPUT);
+  pinMode(A_LPWM, OUTPUT);
+  pinMode(A_R_EN, OUTPUT);
+  pinMode(A_L_EN, OUTPUT);
+
+  pinMode(B_RPWM, OUTPUT);
+  pinMode(B_LPWM, OUTPUT);
+  pinMode(B_R_EN, OUTPUT);
+  pinMode(B_L_EN, OUTPUT);
+
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+
+  esp_now_register_recv_cb(onDataRecv);
+
+  Serial.println("ESP-NOW Receiver Ready (New Pins)");
+}
+
+void loop() {
+  // handled by ESP-NOW callback
+}
+
+--------------------------------
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+// ================= RECEIVER MAC =================
+uint8_t receiverMac[] = {0x98, 0xF4, 0xAB, 0x09, 0x61, 0xB4};
+
+// ================= BUZZER =================
+#define BUZZER_PIN 4
+
+// ================= PS2 JOYSTICK =================
+#define VRX_PIN 34
+#define VRY_PIN 35
+#define BTN_PIN 32
+
+#define ADC_MAX 4095
+#define DEADZONE 350
+#define OUT_MAX 1000
+
+// -------- PERFECT SYMMETRY CALIB --------
+int centerX, centerY;
+int maxUp, maxDown, maxLeft, maxRight;
+
+// -------- BUZZER STATE --------
+bool espNowConnected = false;
+
+// ================= DATA STRUCT =================
+typedef struct {
+  int motorA;
+  int motorB;
+  int button;
+} struct_message;
+
+struct_message tx;
+
+// ================= BUZZER HELPERS =================
+void beep(int ms)
+{
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(ms);
+  digitalWrite(BUZZER_PIN, LOW);
+  delay(100);
+}
+
+void doubleBeep()
+{
+  beep(120);
+  beep(120);
+}
+
+// ================= ESP-NOW CALLBACK =================
+void onSent(const wifi_tx_info_t *info, esp_now_send_status_t status)
+{
+  // First successful transmission = CONNECTED
+  if (!espNowConnected && status == ESP_NOW_SEND_SUCCESS) {
+    espNowConnected = true;
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(2000);                // 2 seconds continuous beep
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(BTN_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  analogReadResolution(12);
+  delay(500);
+
+  // -------- POWER ON BEEP (TWICE) --------
+  doubleBeep();
+
+  // -------- CENTER CALIBRATION --------
+  long sx = 0, sy = 0;
+  for (int i = 0; i < 200; i++) {
+    sx += analogRead(VRX_PIN);
+    sy += analogRead(VRY_PIN);
+    delay(5);
+  }
+  centerX = sx / 200;
+  centerY = sy / 200;
+
+  // Init limits
+  maxUp = maxDown = maxLeft = maxRight = 1;
+
+  Serial.println("Move joystick fully in all directions...");
+
+  // -------- ESP-NOW --------
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+
+  esp_now_register_send_cb(onSent);
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, receiverMac, 6);
+  peer.channel = 1;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+}
+
+void loop()
+{
+  int rawX = analogRead(VRX_PIN);
+  int rawY = analogRead(VRY_PIN);
+
+  // -------- AUTO-LEARN MAX LIMITS --------
+  maxUp    = max(maxUp, centerY - rawY);
+  maxDown  = max(maxDown, rawY - centerY);
+  maxLeft  = max(maxLeft, centerX - rawX);
+  maxRight = max(maxRight, rawX - centerX);
+
+  int x = rawX - centerX;
+  int y = rawY - centerY;
+
+  int up = 0, down = 0, left = 0, right = 0;
+
+  int absX = abs(x);
+  int absY = abs(y);
+
+  // -------- DOMINANT AXIS LOCK --------
+  if (absY > absX && absY > DEADZONE) {
+    if (y < 0)
+      up = map(absY, DEADZONE, maxUp, 0, OUT_MAX);
+    else
+      down = map(absY, DEADZONE, maxDown, 0, OUT_MAX);
+  }
+  else if (absX > DEADZONE) {
+    if (x > 0)
+      right = map(absX, DEADZONE, maxRight, 0, OUT_MAX);
+    else
+      left = map(absX, DEADZONE, maxLeft, 0, OUT_MAX);
+  }
+
+  // -------- SAFETY CLAMP --------
+  up    = constrain(up, 0, OUT_MAX);
+  down  = constrain(down, 0, OUT_MAX);
+  left  = constrain(left, 0, OUT_MAX);
+  right = constrain(right, 0, OUT_MAX);
+
+  // ================= RC MIXING =================
+  int throttle = up - down;
+  int steering = right - left;
+
+  tx.motorA = constrain(throttle + steering, -OUT_MAX, OUT_MAX);
+  tx.motorB = constrain(throttle - steering, -OUT_MAX, OUT_MAX);
+  tx.button = (digitalRead(BTN_PIN) == LOW) ? 1 : 0;
+
+  esp_now_send(receiverMac, (uint8_t *)&tx, sizeof(tx));
+
+  // -------- DEBUG --------
+  Serial.print("UP:");
+  Serial.print(up);
+  Serial.print(" DOWN:");
+  Serial.print(down);
+  Serial.print(" LEFT:");
+  Serial.print(left);
+  Serial.print(" RIGHT:");
+  Serial.print(right);
+  Serial.print(" | A:");
+  Serial.print(tx.motorA);
+  Serial.print(" B:");
+  Serial.print(tx.motorB);
+  Serial.print(" BTN:");
+  Serial.println(tx.button);
+
+  delay(60);
+}
 
